@@ -146,6 +146,58 @@
     outline:none;
     border-color:var(--gold);
   }
+  .address-field{
+    position:relative;
+  }
+  .suggestions{
+    display:none;
+    position:absolute;
+    top:calc(100% - 6px);
+    left:0;
+    right:0;
+    background:var(--card);
+    border:2px solid var(--line);
+    border-radius:14px;
+    box-shadow:0 8px 20px rgba(30,42,51,0.15);
+    z-index:20;
+    overflow:hidden;
+    margin-bottom:12px;
+  }
+  .suggestions.open{ display:block; }
+  .suggestion-item{
+    display:block;
+    width:100%;
+    text-align:left;
+    background:none;
+    border:none;
+    padding:14px 16px;
+    font-family:'Source Sans 3', sans-serif;
+    font-size:17px;
+    color:var(--ink);
+    cursor:pointer;
+    border-bottom:1px solid var(--line);
+  }
+  .suggestion-item:last-child{ border-bottom:none; }
+  .suggestion-item:hover, .suggestion-item:focus{
+    background:var(--paper);
+    outline:none;
+  }
+  .suggestion-hint{
+    font-size:15px;
+    opacity:0.7;
+    margin:6px 0 12px;
+  }
+  .suggestion-hint button{
+    background:none;
+    border:none;
+    color:var(--plum);
+    font-weight:700;
+    font-size:15px;
+    text-decoration:underline;
+    cursor:pointer;
+    padding:0;
+    margin:0 4px;
+  }
   .btn-secondary{
     background:var(--paper);
     color:var(--plum);
@@ -469,7 +521,10 @@
 
     <button class="btn btn-primary" id="useLocationBtn">📍 Use my current location</button>
     <p class="or-divider">— or —</p>
-    <input type="text" id="addressInput" placeholder="Type your city or ZIP code">
+    <div class="address-field">
+      <input type="text" id="addressInput" placeholder="Type your city or ZIP code" autocomplete="off">
+      <div class="suggestions" id="addressSuggestions"></div>
+    </div>
     <button class="btn btn-primary" id="setAddressBtn">Set this as my location</button>
     <p class="location-confirm" id="locationConfirm"></p>
 
@@ -521,6 +576,7 @@ const COMPARE_URL = 'https://script.google.com/macros/s/AKfycbwkgDpm2tgGskiYr89I
 
 const useLocationBtn = document.getElementById('useLocationBtn');
 const addressInput = document.getElementById('addressInput');
+const addressSuggestions = document.getElementById('addressSuggestions');
 const setAddressBtn = document.getElementById('setAddressBtn');
 const locationConfirm = document.getElementById('locationConfirm');
 const listTextarea = document.getElementById('listTextarea');
@@ -561,6 +617,30 @@ function haversineMiles(lat1, lon1, lat2, lon2){
   const dLon = toRad(lon2 - lon1);
   const a = Math.sin(dLat/2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+const US_STATE_ABBR = {
+  'Alabama':'AL','Alaska':'AK','Arizona':'AZ','Arkansas':'AR','California':'CA','Colorado':'CO',
+  'Connecticut':'CT','Delaware':'DE','Florida':'FL','Georgia':'GA','Hawaii':'HI','Idaho':'ID',
+  'Illinois':'IL','Indiana':'IN','Iowa':'IA','Kansas':'KS','Kentucky':'KY','Louisiana':'LA',
+  'Maine':'ME','Maryland':'MD','Massachusetts':'MA','Michigan':'MI','Minnesota':'MN','Mississippi':'MS',
+  'Missouri':'MO','Montana':'MT','Nebraska':'NE','Nevada':'NV','New Hampshire':'NH','New Jersey':'NJ',
+  'New Mexico':'NM','New York':'NY','North Carolina':'NC','North Dakota':'ND','Ohio':'OH','Oklahoma':'OK',
+  'Oregon':'OR','Pennsylvania':'PA','Rhode Island':'RI','South Carolina':'SC','South Dakota':'SD',
+  'Tennessee':'TN','Texas':'TX','Utah':'UT','Vermont':'VT','Virginia':'VA','Washington':'WA',
+  'West Virginia':'WV','Wisconsin':'WI','Wyoming':'WY','District of Columbia':'DC'
+};
+
+// Formats a Nominatim result as "City, State" instead of its full, cluttered
+// display_name (which usually includes county/country). Falls back gracefully
+// if a place doesn't have both parts (e.g. a small town or a non-US location).
+function formatCityState(result){
+  const addr = result.address || {};
+  const city = addr.city || addr.town || addr.village || addr.hamlet || addr.municipality || result.name;
+  const state = (addr.country_code === 'us' && US_STATE_ABBR[addr.state]) || addr.state;
+  if(city && state) return `${city}, ${state}`;
+  if(city) return city;
+  return result.display_name;
 }
 
 async function geocode(query){
@@ -636,16 +716,147 @@ setAddressBtn.addEventListener('click', async () => {
     setStatus('Please enter a city or ZIP code first.', true);
     return;
   }
+  hideSuggestions();
   locationConfirm.textContent = 'Finding that location…';
   const loc = await geocode(address);
   if(!loc){
     locationConfirm.textContent = '';
-    setStatus('Could not find that location. Please check the spelling and try again.', true);
+    await showDidYouMean(address);
     return;
   }
   currentUserLoc = loc;
   locationConfirm.textContent = `📍 Location set: ${escapeHtml(address)}`;
+  setStatus('');
 });
+
+// ---- Live suggestions while typing ----
+
+let suggestionDebounceTimer = null;
+let selectedSuggestionText = ''; // tracks the exact text of a chosen suggestion
+
+addressInput.addEventListener('input', () => {
+  const query = addressInput.value.trim();
+  // If they're still editing a previously-selected suggestion unchanged, don't re-search.
+  if(query === selectedSuggestionText) return;
+
+  clearTimeout(suggestionDebounceTimer);
+  if(query.length < 3){
+    hideSuggestions();
+    return;
+  }
+  suggestionDebounceTimer = setTimeout(() => fetchSuggestions(query), 400);
+});
+
+document.addEventListener('click', (e) => {
+  if(!e.target.closest('.address-field')) hideSuggestions();
+});
+
+async function fetchSuggestions(query){
+  try{
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&q=' + encodeURIComponent(query);
+    const res = await fetch(url);
+    const data = await res.json();
+    renderSuggestions(data || []);
+  }catch(err){
+    console.warn('[Bargain Basket] Suggestion lookup failed:', err);
+    hideSuggestions();
+  }
+}
+
+function renderSuggestions(results){
+  if(!results.length){
+    hideSuggestions();
+    return;
+  }
+
+  // Collapse to City, State labels and drop duplicates (multiple raw Nominatim
+  // results can map to the same city-level label once trimmed down).
+  const seen = new Set();
+  const deduped = [];
+  results.forEach(r => {
+    const label = formatCityState(r);
+    const key = label.toLowerCase();
+    if(!seen.has(key)){
+      seen.add(key);
+      deduped.push({ label, lat: parseFloat(r.lat), lon: parseFloat(r.lon) });
+    }
+  });
+
+  if(deduped.length === 0){
+    hideSuggestions();
+    return;
+  }
+
+  addressSuggestions.innerHTML = deduped.map((r, i) =>
+    `<button type="button" class="suggestion-item" data-index="${i}">${escapeHtml(r.label)}</button>`
+  ).join('');
+  addressSuggestions.classList.add('open');
+
+  addressSuggestions.querySelectorAll('.suggestion-item').forEach((btn, i) => {
+    btn.addEventListener('click', () => {
+      const r = deduped[i];
+      addressInput.value = r.label;
+      selectedSuggestionText = r.label;
+      geocodeCache[r.label.trim().toLowerCase()] = { lat: r.lat, lon: r.lon };
+      hideSuggestions();
+    });
+  });
+}
+
+function hideSuggestions(){
+  addressSuggestions.classList.remove('open');
+  addressSuggestions.innerHTML = '';
+}
+
+// ---- "Did you mean" fallback when a typed address doesn't resolve cleanly ----
+
+async function showDidYouMean(address){
+  try{
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&q=' + encodeURIComponent(address);
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if(!data || data.length === 0){
+      setStatus('Could not find that location. Please check the spelling and try again.', true);
+      return;
+    }
+
+    const seen = new Set();
+    const deduped = [];
+    data.forEach(r => {
+      const label = formatCityState(r);
+      const key = label.toLowerCase();
+      if(!seen.has(key)){
+        seen.add(key);
+        deduped.push({ label, lat: parseFloat(r.lat), lon: parseFloat(r.lon) });
+      }
+    });
+
+    if(deduped.length === 0){
+      setStatus('Could not find that location. Please check the spelling and try again.', true);
+      return;
+    }
+
+    const chipsHtml = deduped.slice(0, 3).map((r, i) =>
+      `<button type="button" data-index="${i}">${escapeHtml(r.label)}</button>`
+    ).join('');
+    statusNote.innerHTML = `<span class="suggestion-hint">Did you mean: ${chipsHtml}</span>`;
+    statusNote.className = 'status-note';
+
+    statusNote.querySelectorAll('button').forEach((btn, i) => {
+      btn.addEventListener('click', () => {
+        const r = deduped[i];
+        addressInput.value = r.label;
+        currentUserLoc = { lat: r.lat, lon: r.lon };
+        locationConfirm.textContent = `📍 Location set: ${escapeHtml(r.label)}`;
+        setStatus('');
+      });
+    });
+  }catch(err){
+    console.warn('[Bargain Basket] Did-you-mean lookup failed:', err);
+    setStatus('Could not find that location. Please check the spelling and try again.', true);
+  }
+}
 
 // ---- Grocery list photo extraction (Gemini vision, bring-your-own free key) ----
 
