@@ -964,15 +964,53 @@ function normalizeItemName(s){
   return s.trim().toLowerCase();
 }
 
+// Standard edit-distance calculation: how many single-character insertions,
+// deletions, or substitutions turn one word into the other. Lower = more similar.
+function levenshteinDistance(a, b){
+  const m = a.length, n = b.length;
+  if(m === 0) return n;
+  if(n === 0) return m;
+
+  let prevRow = Array.from({ length: n + 1 }, (_, j) => j);
+  for(let i = 1; i <= m; i++){
+    const currRow = [i];
+    for(let j = 1; j <= n; j++){
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      currRow[j] = Math.min(
+        prevRow[j] + 1,       // deletion
+        currRow[j - 1] + 1,   // insertion
+        prevRow[j - 1] + cost // substitution
+      );
+    }
+    prevRow = currRow;
+  }
+  return prevRow[n];
+}
+
+// Two words count as a fuzzy match if they're close enough in spelling to
+// very likely be the same word with a typo — the allowed distance scales
+// with word length so short words still need to be quite close.
+function isFuzzyWordMatch(w1, w2){
+  if(w1 === w2) return true;
+  const maxLen = Math.max(w1.length, w2.length);
+  if(maxLen < 4) return false; // too short to safely fuzzy-match without false positives
+  const allowedDistance = maxLen <= 5 ? 1 : (maxLen <= 9 ? 2 : 3);
+  return levenshteinDistance(w1, w2) <= allowedDistance;
+}
+
 function isMatch(listItem, produceName){
   const a = normalizeItemName(listItem);
   const b = normalizeItemName(produceName);
   if(!a || !b) return false;
   if(a === b) return true;
   if(b.includes(a) || a.includes(b)) return true;
+
   const aWords = a.split(/\s+/).filter(w => w.length >= 3);
   const bWords = b.split(/\s+/).filter(w => w.length >= 3);
-  return aWords.some(w => bWords.includes(w));
+  if(aWords.some(w => bWords.includes(w))) return true;
+
+  // Fallback: allow for spelling mistakes (e.g. "tomatoe" vs "tomato").
+  return aWords.some(aw => bWords.some(bw => isFuzzyWordMatch(aw, bw)));
 }
 
 function buildShoppingPlan(groceryList, withDistanceItems){
@@ -1095,6 +1133,28 @@ function renderTripPlan(groceryList, withDistanceItems){
 
 // ---- Browse-all fallback (used when no grocery list is given) ----
 
+// Keeps only the cheapest listing per store within a set of entries — so a
+// store that got scanned more than once for the same item only shows up
+// once, at its best price, instead of cluttering the list with repeats.
+// Entries with no store name can't be safely merged (we don't know if they're
+// really the same place), so those are all kept as-is.
+function dedupeByStore(entries){
+  const cheapestByStore = new Map();
+  const noStoreEntries = [];
+  entries.forEach(item => {
+    const key = (item.store || '').trim().toLowerCase();
+    if(!key){
+      noStoreEntries.push(item);
+      return;
+    }
+    const existing = cheapestByStore.get(key);
+    if(!existing || item._priceNum < existing._priceNum){
+      cheapestByStore.set(key, item);
+    }
+  });
+  return [...cheapestByStore.values(), ...noStoreEntries];
+}
+
 function renderBrowseAll(items){
   resultsArea.innerHTML = '';
 
@@ -1121,7 +1181,8 @@ function renderBrowseAll(items){
   Object.values(groups)
     .sort((a, b) => a.label.localeCompare(b.label))
     .forEach(group => {
-      group.entries.sort((a, b) => a._priceNum - b._priceNum);
+      const deduped = dedupeByStore(group.entries);
+      deduped.sort((a, b) => a._priceNum - b._priceNum);
 
       const groupDiv = document.createElement('div');
       groupDiv.className = 'produce-group';
@@ -1130,7 +1191,7 @@ function renderBrowseAll(items){
       nameEl.textContent = group.label;
       groupDiv.appendChild(nameEl);
 
-      group.entries.slice(0, 4).forEach(item => {
+      deduped.slice(0, 4).forEach(item => {
         const card = document.createElement('div');
         card.className = 'price-card';
         const priceLabel = item.priceItem || item.priceWeight;
