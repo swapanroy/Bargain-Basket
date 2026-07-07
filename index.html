@@ -232,26 +232,6 @@
     resize:vertical;
   }
   textarea:focus{ outline:none; border-color:var(--gold); }
-  .photo-status{
-    font-size:15px;
-    color:var(--sage);
-    min-height:20px;
-    margin:8px 0 0;
-  }
-  .photo-status.err{ color:#8A3B32; font-weight:600; }
-  .ai-connect{
-    display:none;
-    margin-top:16px;
-    padding-top:16px;
-    border-top:1.5px dashed var(--line);
-  }
-  .ai-connect.open{ display:block; }
-  .ai-connect-label{
-    font-size:15px;
-    opacity:0.8;
-    margin:0 0 12px;
-  }
-  #geminiKeyInput{ margin-top:10px; }
   .distance-row{
     margin-top:18px;
   }
@@ -472,6 +452,36 @@
     margin:12px 0 0;
     line-height:1.5;
   }
+  .nearby-store-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:12px;
+    padding:12px 0;
+    border-bottom:1px solid var(--line);
+    text-align:left;
+  }
+  .nearby-store-row:last-of-type{ border-bottom:none; }
+  .nearby-store-name{
+    font-weight:700;
+    font-size:17px;
+  }
+  .nearby-store-distance{
+    font-size:15px;
+    color:var(--sage);
+  }
+  .nearby-store-row a{
+    color:var(--plum);
+    font-weight:700;
+    text-decoration:none;
+    font-size:17px;
+  }
+  .nearby-store-row a:hover{ text-decoration:underline; }
+  .no-phone{
+    font-size:14px;
+    opacity:0.6;
+    font-style:italic;
+  }
 
   .disclaimer{
     margin-top:40px;
@@ -543,21 +553,9 @@
       <div class="step-badge">2</div>
       <p class="search-label">What's on your list?</p>
     </div>
-    <p class="step2-sub">Type your list below, or add a photo of a handwritten or printed list.</p>
+    <p class="step2-sub">Type your list below, one item per line.</p>
 
     <textarea id="listTextarea" rows="5" placeholder="e.g.&#10;tomatoes&#10;bananas&#10;eggs&#10;bread"></textarea>
-
-    <p class="or-divider">— or —</p>
-    <input type="file" id="listPhotoInput" accept="image/*" style="display:none;">
-    <button class="btn btn-secondary" id="listPhotoBtn">📷 Add a photo of your list</button>
-    <p class="photo-status" id="photoStatus"></p>
-
-    <div class="ai-connect" id="aiConnect">
-      <p class="ai-connect-label">Reading a photo needs a free connection to Google's AI (one-time, takes a minute).</p>
-      <button class="btn btn-secondary" id="getGeminiKeyBtn" type="button">Get my free code from Google ↗</button>
-      <input type="password" id="geminiKeyInput" placeholder="Paste your code here">
-      <button class="btn btn-primary" id="connectGeminiBtn" type="button">Connect</button>
-    </div>
   </div>
 
   <button class="btn btn-primary btn-large" id="findTripBtn">🛒 Find my shopping trip</button>
@@ -580,13 +578,6 @@ const addressSuggestions = document.getElementById('addressSuggestions');
 const setAddressBtn = document.getElementById('setAddressBtn');
 const locationConfirm = document.getElementById('locationConfirm');
 const listTextarea = document.getElementById('listTextarea');
-const listPhotoInput = document.getElementById('listPhotoInput');
-const listPhotoBtn = document.getElementById('listPhotoBtn');
-const photoStatus = document.getElementById('photoStatus');
-const aiConnect = document.getElementById('aiConnect');
-const getGeminiKeyBtn = document.getElementById('getGeminiKeyBtn');
-const geminiKeyInput = document.getElementById('geminiKeyInput');
-const connectGeminiBtn = document.getElementById('connectGeminiBtn');
 const findTripBtn = document.getElementById('findTripBtn');
 const statusNote = document.getElementById('statusNote');
 const resultsArea = document.getElementById('resultsArea');
@@ -595,7 +586,6 @@ const distancePills = document.querySelectorAll('.distance-pill');
 let selectedMiles = 10;
 let geocodeCache = {};
 let currentUserLoc = null;
-let geminiApiKey = '';
 
 distancePills.forEach(pill => {
   pill.addEventListener('click', () => {
@@ -643,12 +633,31 @@ function formatCityState(result){
   return result.display_name;
 }
 
+// Builds a Nominatim search URL. Plain 5-digit input is treated as a US ZIP
+// code using a structured query (much more reliable than a free-text search
+// for postal codes). Everything else is biased toward the US, since that's
+// this app's intended audience — without this, an ambiguous town name could
+// resolve to a same-named place in another country entirely.
+function buildNominatimUrl(query, limit, addressDetails){
+  const trimmed = query.trim();
+  const params = ['format=json', `limit=${limit}`, 'countrycodes=us'];
+  if(addressDetails) params.push('addressdetails=1');
+
+  if(/^\d{5}$/.test(trimmed)){
+    params.push('postalcode=' + encodeURIComponent(trimmed));
+    params.push('country=US');
+  } else {
+    params.push('q=' + encodeURIComponent(trimmed));
+  }
+  return 'https://nominatim.openstreetmap.org/search?' + params.join('&');
+}
+
 async function geocode(query){
   const key = query.trim().toLowerCase();
   if(!key) return null;
   if(key in geocodeCache) return geocodeCache[key];
   try{
-    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(query);
+    const url = buildNominatimUrl(query, 1, false);
     const res = await fetch(url);
     const data = await res.json();
     const result = (data && data[0]) ? { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) } : null;
@@ -673,13 +682,71 @@ function escapeHtml(str){
   return div.innerHTML;
 }
 
-function renderEmptyState(heading, explanation){
+// Looks up real nearby grocery stores via OpenStreetMap's free Overpass API —
+// no key needed. Phone numbers come from community-maintained map data, so
+// they're not guaranteed to exist or be current; that's stated plainly in the UI.
+async function findNearbyGroceryStores(userLoc, radiusMiles, maxResults){
+  const radiusMeters = Math.round(Math.min(radiusMiles, 25) * 1609.34);
+  const query = `[out:json][timeout:15];(node["shop"~"supermarket|greengrocer|convenience"](around:${radiusMeters},${userLoc.lat},${userLoc.lon}););out body ${maxResults * 4};`;
+  const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+
+  try{
+    const res = await fetch(url);
+    const data = await res.json();
+    const stores = (data.elements || [])
+      .map(el => {
+        const tags = el.tags || {};
+        return {
+          name: tags.name || '',
+          phone: tags.phone || tags['contact:phone'] || '',
+          distance: haversineMiles(userLoc.lat, userLoc.lon, el.lat, el.lon)
+        };
+      })
+      .filter(s => s.name) // skip unnamed map points, not useful to show
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, maxResults);
+    return stores;
+  }catch(err){
+    console.warn('[Bargain Basket] Nearby store lookup failed:', err);
+    return [];
+  }
+}
+
+async function renderEmptyState(heading, explanation){
   const searchQuery = encodeURIComponent('grocery store weekly ad deals near me');
+
+  let nearbyStoresHtml = '';
+  if(currentUserLoc){
+    const stores = await findNearbyGroceryStores(currentUserLoc, selectedMiles, 3);
+    if(stores.length > 0){
+      const rows = stores.map(s => {
+        const phoneHtml = s.phone
+          ? `<a href="tel:${escapeHtml(s.phone.replace(/[^\d+]/g, ''))}">${escapeHtml(s.phone)}</a>`
+          : `<span class="no-phone">Phone not listed</span>`;
+        return `
+          <div class="nearby-store-row">
+            <div>
+              <div class="nearby-store-name">${escapeHtml(s.name)}</div>
+              <div class="nearby-store-distance">${s.distance.toFixed(1)} miles away</div>
+            </div>
+            <div>${phoneHtml}</div>
+          </div>`;
+      }).join('');
+      nearbyStoresHtml = `
+        <div class="fallback-card">
+          <p class="fallback-label">Grocery stores nearby you could call directly:</p>
+          ${rows}
+          <p class="fallback-note">Store listings and phone numbers come from community map data and may be incomplete or outdated — worth double-checking before you drive over.</p>
+        </div>`;
+    }
+  }
+
   resultsArea.innerHTML = `
     <div class="empty-state">
       <strong>${escapeHtml(heading)}</strong>
       ${escapeHtml(explanation)}
     </div>
+    ${nearbyStoresHtml}
     <div class="fallback-card">
       <p class="fallback-label">While you wait for more local prices to be added, try these instead:</p>
       <a class="btn btn-primary" href="https://www.google.com/search?q=${searchQuery}" target="_blank" rel="noopener">🔎 Search Google for deals near you</a>
@@ -753,7 +820,7 @@ document.addEventListener('click', (e) => {
 
 async function fetchSuggestions(query){
   try{
-    const url = 'https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&q=' + encodeURIComponent(query);
+    const url = buildNominatimUrl(query, 5, true);
     const res = await fetch(url);
     const data = await res.json();
     renderSuggestions(data || []);
@@ -812,7 +879,7 @@ function hideSuggestions(){
 
 async function showDidYouMean(address){
   try{
-    const url = 'https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&q=' + encodeURIComponent(address);
+    const url = buildNominatimUrl(address, 5, true);
     const res = await fetch(url);
     const data = await res.json();
 
@@ -860,104 +927,6 @@ async function showDidYouMean(address){
 
 // ---- Grocery list photo extraction (Gemini vision, bring-your-own free key) ----
 
-getGeminiKeyBtn.addEventListener('click', () => {
-  window.open('https://aistudio.google.com/apikey', '_blank', 'noopener');
-});
-
-connectGeminiBtn.addEventListener('click', () => {
-  const key = geminiKeyInput.value.replace(/\s+/g, '');
-  if(!key){
-    photoStatus.textContent = 'Paste your code in the box first.';
-    photoStatus.className = 'photo-status err';
-    return;
-  }
-  geminiApiKey = key;
-  photoStatus.className = 'photo-status';
-  photoStatus.textContent = 'Connected! Now choose your photo again.';
-});
-
-listPhotoBtn.addEventListener('click', () => listPhotoInput.click());
-
-listPhotoInput.addEventListener('change', async () => {
-  const file = listPhotoInput.files[0];
-  if(!file) return;
-
-  if(!geminiApiKey){
-    aiConnect.classList.add('open');
-    photoStatus.className = 'photo-status err';
-    photoStatus.textContent = 'Connect Google AI below first, then choose your photo again.';
-    return;
-  }
-
-  photoStatus.className = 'photo-status';
-  photoStatus.textContent = 'Reading your list…';
-
-  try{
-    const dataUrl = await fileToDataUrl(file);
-    const base64 = dataUrl.split(',')[1];
-    const items = await extractListFromPhoto(base64, file.type || 'image/jpeg');
-    if(items.length === 0){
-      photoStatus.className = 'photo-status err';
-      photoStatus.textContent = 'Could not read any items from that photo — try a clearer shot, or type your list instead.';
-      return;
-    }
-    const existing = listTextarea.value.trim();
-    listTextarea.value = existing ? existing + '\n' + items.join('\n') : items.join('\n');
-    photoStatus.textContent = `Added ${items.length} item${items.length===1?'':'s'} from your photo.`;
-  }catch(err){
-    console.warn('[Bargain Basket] Photo list extraction failed:', err);
-    photoStatus.className = 'photo-status err';
-    photoStatus.textContent = 'Something went wrong reading that photo. Please try again, or type your list instead.';
-  }
-});
-
-function fileToDataUrl(file){
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-async function extractListFromPhoto(base64, mediaType){
-  const prompt =
-    'This image shows a handwritten or printed grocery/shopping list. ' +
-    'Extract each distinct grocery item mentioned. Respond with ONLY a raw JSON array ' +
-    'of plain strings, e.g. ["milk","eggs","bananas"]. No markdown fences, no explanation, ' +
-    'JSON only. If nothing is legible, return [].';
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: mediaType, data: base64 } }
-        ]
-      }]
-    })
-  });
-  const data = await response.json();
-  if(data.error) throw new Error(data.error.message || 'Gemini API error');
-  const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-               data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-               data.candidates[0].content.parts[0].text;
-  if(!text) throw new Error('No response from Gemini');
-
-  let clean = text.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-  let parsed;
-  try{
-    parsed = JSON.parse(clean);
-  }catch(e){
-    const match = clean.match(/\[[\s\S]*\]/);
-    parsed = match ? JSON.parse(match[0]) : [];
-  }
-  return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
-}
-
 // ---- Matching a grocery list against nearby prices ----
 
 function normalizeItemName(s){
@@ -998,6 +967,44 @@ function isFuzzyWordMatch(w1, w2){
   return levenshteinDistance(w1, w2) <= allowedDistance;
 }
 
+// Descriptive words that shouldn't block a match — "onions" should match
+// "Red Onions" just as well as plain "Onions". Stripped out as a fallback
+// comparison layer, not used to override a more specific match when one exists.
+const QUALIFIER_WORDS = new Set([
+  'red','yellow','white','green','purple','sweet','organic','fresh','ripe',
+  'large','small','medium','baby','regular','italian','spanish','vidalia',
+  'holland','hollandse','dutch','imported','import','local','premium','type',
+  'kl','verse'
+]);
+
+function stripQualifiers(words){
+  const filtered = words.filter(w => !QUALIFIER_WORDS.has(w));
+  return filtered.length > 0 ? filtered : words; // never strip everything away
+}
+
+// Genuinely different words for the same produce — these won't match via
+// substring/word-overlap since they don't share a root, so they're handled
+// as an explicit lookup instead.
+const SYNONYM_GROUPS = [
+  ['onion','onions','scallion','scallions','green onion','green onions','spring onion','spring onions'],
+  ['pepper','peppers','capsicum','capsicums'],
+  ['eggplant','eggplants','aubergine','aubergines'],
+  ['zucchini','zucchinis','courgette','courgettes'],
+  ['cilantro','coriander'],
+  ['garbanzo','garbanzos','chickpea','chickpeas']
+];
+
+// Checks whether the two full (normalized) strings each contain a phrase from
+// the same synonym group — substring-based rather than single-word-token
+// based, so multi-word phrases like "green onion" actually work.
+function sharesSynonymGroup(a, b){
+  return SYNONYM_GROUPS.some(group => {
+    const aHas = group.some(phrase => a.includes(phrase));
+    const bHas = group.some(phrase => b.includes(phrase));
+    return aHas && bHas;
+  });
+}
+
 function isMatch(listItem, produceName){
   const a = normalizeItemName(listItem);
   const b = normalizeItemName(produceName);
@@ -1005,9 +1012,22 @@ function isMatch(listItem, produceName){
   if(a === b) return true;
   if(b.includes(a) || a.includes(b)) return true;
 
-  const aWords = a.split(/\s+/).filter(w => w.length >= 3);
-  const bWords = b.split(/\s+/).filter(w => w.length >= 3);
+  const aWordsAll = a.split(/\s+/).filter(Boolean);
+  const bWordsAll = b.split(/\s+/).filter(Boolean);
+  const aWords = aWordsAll.filter(w => w.length >= 3);
+  const bWords = bWordsAll.filter(w => w.length >= 3);
+
   if(aWords.some(w => bWords.includes(w))) return true;
+
+  // Known alternate names for the same produce (e.g. scallion = green onion).
+  if(sharesSynonymGroup(a, b)) return true;
+
+  // Ignore descriptive qualifiers and compare just the core word(s) — catches
+  // generic-vs-specific cases (e.g. "onions" vs "Red Onions") robustly even
+  // if the checks above miss it for some reason (word order, extra words).
+  const aCore = stripQualifiers(aWords);
+  const bCore = stripQualifiers(bWords);
+  if(aCore.some(w => bCore.includes(w))) return true;
 
   // Fallback: allow for spelling mistakes (e.g. "tomatoe" vs "tomato").
   return aWords.some(aw => bWords.some(bw => isFuzzyWordMatch(aw, bw)));
@@ -1048,12 +1068,12 @@ function buildShoppingPlan(groceryList, withDistanceItems){
   return { perItemMatches, bestStore: storeCandidates[0] || null };
 }
 
-function renderTripPlan(groceryList, withDistanceItems){
+async function renderTripPlan(groceryList, withDistanceItems){
   resultsArea.innerHTML = '';
   const { perItemMatches, bestStore } = buildShoppingPlan(groceryList, withDistanceItems);
 
   if(!bestStore){
-    renderEmptyState(
+    await renderEmptyState(
       'No matches found nearby',
       `None of your list items were found within ${selectedMiles} miles. Try a wider distance, or check back as more prices get added.`
     );
@@ -1155,11 +1175,11 @@ function dedupeByStore(entries){
   return [...cheapestByStore.values(), ...noStoreEntries];
 }
 
-function renderBrowseAll(items){
+async function renderBrowseAll(items){
   resultsArea.innerHTML = '';
 
   if(items.length === 0){
-    renderEmptyState(
+    await renderEmptyState(
       'No bargains found that close',
       'Try a wider distance, or check back later as more prices get added.'
     );
@@ -1278,9 +1298,9 @@ findTripBtn.addEventListener('click', async () => {
     .filter(Boolean);
 
   if(groceryList.length === 0){
-    renderBrowseAll(withDistance);
+    await renderBrowseAll(withDistance);
   } else {
-    renderTripPlan(groceryList, withDistance);
+    await renderTripPlan(groceryList, withDistance);
   }
 });
 </script>
