@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bargain Basket — Find Cheap Groceries Near You</title>
+<title>Bargain Basket — Smart Shopping, Made Simple</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Bitter:wght@600;700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
@@ -712,8 +712,15 @@ async function findNearbyGroceryStores(userLoc, radiusMiles, maxResults){
   }
 }
 
-async function renderEmptyState(heading, explanation){
-  const searchQuery = encodeURIComponent('grocery store weekly ad deals near me');
+// Builds the "here's what to do instead" section — real nearby grocery
+// stores (with phone numbers where available) plus search fallback links.
+// Reused both for the fully-empty case and for partial matches (some items
+// found, some not), so nobody's ever left with just "not found nearby" and
+// no next step.
+async function buildFallbackHtml(missingLabel){
+  const searchQuery = encodeURIComponent(
+    missingLabel ? `where to buy ${missingLabel} near me` : 'grocery store weekly ad deals near me'
+  );
 
   let nearbyStoresHtml = '';
   if(currentUserLoc){
@@ -741,18 +748,24 @@ async function renderEmptyState(heading, explanation){
     }
   }
 
+  return `
+    ${nearbyStoresHtml}
+    <div class="fallback-card">
+      <p class="fallback-label">${missingLabel ? `For ${escapeHtml(missingLabel)}, also try:` : 'While you wait for more local prices to be added, try these instead:'}</p>
+      <a class="btn btn-primary" href="https://www.google.com/search?q=${searchQuery}" target="_blank" rel="noopener">🔎 Search Google for deals near you</a>
+      <a class="btn btn-secondary" href="https://flipp.com/" target="_blank" rel="noopener">🗞️ Browse local grocery flyers (Flipp)</a>
+      <p class="fallback-note">Know someone nearby who could scan a few price tags? Every scan on Stall Ledger makes this page more useful for everyone close by.</p>
+    </div>`;
+}
+
+async function renderEmptyState(heading, explanation){
+  const fallbackHtml = await buildFallbackHtml(null);
   resultsArea.innerHTML = `
     <div class="empty-state">
       <strong>${escapeHtml(heading)}</strong>
       ${escapeHtml(explanation)}
     </div>
-    ${nearbyStoresHtml}
-    <div class="fallback-card">
-      <p class="fallback-label">While you wait for more local prices to be added, try these instead:</p>
-      <a class="btn btn-primary" href="https://www.google.com/search?q=${searchQuery}" target="_blank" rel="noopener">🔎 Search Google for deals near you</a>
-      <a class="btn btn-secondary" href="https://flipp.com/" target="_blank" rel="noopener">🗞️ Browse local grocery flyers (Flipp)</a>
-      <p class="fallback-note">Know someone nearby who could scan a few price tags? Every scan on Stall Ledger makes this page more useful for everyone close by.</p>
-    </div>
+    ${fallbackHtml}
   `;
 }
 
@@ -1149,6 +1162,16 @@ async function renderTripPlan(groceryList, withDistanceItems){
   altCard.innerHTML = `<div class="trip-coverage">Covers ${altFoundCount} of ${groceryList.length} items, across possibly several stores</div><div class="trip-total">Estimated total: $${altTotal.toFixed(2)}</div>`;
   altCard.appendChild(altList);
   resultsArea.appendChild(altCard);
+
+  // If any list item had zero matches anywhere nearby (not just missing from
+  // the best single stop), give a real next step instead of a dead end.
+  const neverFound = perItemMatches.filter(m => m.matches.length === 0).map(m => m.listItem);
+  if(neverFound.length > 0){
+    const fallbackHtml = await buildFallbackHtml(neverFound.join(', '));
+    const fallbackWrap = document.createElement('div');
+    fallbackWrap.innerHTML = fallbackHtml;
+    resultsArea.appendChild(fallbackWrap);
+  }
 }
 
 // ---- Browse-all fallback (used when no grocery list is given) ----
