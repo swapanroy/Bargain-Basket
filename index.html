@@ -1164,35 +1164,71 @@ async function renderTripPlan(groceryList, withDistanceItems){
   }
   resultsArea.appendChild(bestCard);
 
-  // Alternative: cheapest overall, even if it means visiting more than one store
-  const altHeading = document.createElement('p');
-  altHeading.className = 'results-heading alt-heading';
-  altHeading.textContent = 'Or, save more by visiting multiple stores';
-  resultsArea.appendChild(altHeading);
+  // Only worth showing items where a DIFFERENT store than the recommended
+  // best stop is the cheapest option — repeating items that are already
+  // identical to the best-stop plan just adds redundant clutter.
+  const bestStoreKey = (bestStore.store || '').trim().toLowerCase();
+  const switchItems = [];
+  const missingItems = [];
 
-  const altCard = document.createElement('div');
-  altCard.className = 'trip-summary-card alt';
-  const altList = document.createElement('div');
-  altList.className = 'checklist';
-  let altTotal = 0;
-  let altFoundCount = 0;
   perItemMatches.forEach(({ listItem, matches }) => {
-    const row = document.createElement('div');
-    row.className = 'checklist-item';
-    if(matches.length > 0){
-      const best = matches[0];
-      altTotal += best._priceNum || 0;
-      altFoundCount++;
-      row.innerHTML = `<span>✅ ${escapeHtml(listItem)} — ${escapeHtml(best.store || 'Unnamed store')} (${best._distance.toFixed(1)} mi)</span><span>${escapeHtml(best.priceItem || best.priceWeight)}</span>`;
-    } else {
-      row.className += ' missing';
-      row.innerHTML = `<span>➕ ${escapeHtml(listItem)}</span><span>No data found</span>`;
+    if(matches.length === 0){
+      missingItems.push(listItem);
+      return;
     }
-    altList.appendChild(row);
+    const best = matches[0];
+    const bestKey = (best.store || '').trim().toLowerCase();
+    if(bestKey !== bestStoreKey){
+      switchItems.push({ listItem, best });
+    }
   });
-  altCard.innerHTML = `<div class="trip-coverage">Covers ${altFoundCount} of ${groceryList.length} items, across possibly several stores</div><div class="trip-total">Estimated total: $${altTotal.toFixed(2)}</div>`;
-  altCard.appendChild(altList);
-  resultsArea.appendChild(altCard);
+
+  if(switchItems.length === 0 && missingItems.length === 0){
+    // Every item is already at its cheapest nearby price at the best stop —
+    // saying so plainly beats repeating the identical list a second time.
+    const allGoodCard = document.createElement('div');
+    allGoodCard.className = 'trip-summary-card alt';
+    allGoodCard.innerHTML = `<div class="trip-coverage">✅ Your best single stop already has the best nearby price on everything on your list — no need to shop around further.</div>`;
+    resultsArea.appendChild(allGoodCard);
+  } else {
+    const altHeading = document.createElement('p');
+    altHeading.className = 'results-heading alt-heading';
+    altHeading.textContent = switchItems.length > 0
+      ? `Save more by also visiting ${switchItems.length === 1 ? 'one more store' : switchItems.length + ' other stores'}`
+      : 'A few items weren\'t found nearby';
+    resultsArea.appendChild(altHeading);
+
+    const altCard = document.createElement('div');
+    altCard.className = 'trip-summary-card alt';
+    const altList = document.createElement('div');
+    altList.className = 'checklist';
+
+    let extraSavings = 0;
+    switchItems.forEach(({ listItem, best }) => {
+      const row = document.createElement('div');
+      row.className = 'checklist-item';
+      row.innerHTML = `<span>✅ ${escapeHtml(listItem)} — ${escapeHtml(best.store || 'Unnamed store')} (${best._distance.toFixed(1)} mi)</span><span>${escapeHtml(best.priceItem || best.priceWeight)}</span>`;
+      altList.appendChild(row);
+      const atBestStop = bestStore.items[listItem];
+      if(atBestStop){
+        extraSavings += Math.max(0, (atBestStop._priceNum || 0) - (best._priceNum || 0));
+      }
+    });
+    missingItems.forEach(listItem => {
+      const row = document.createElement('div');
+      row.className = 'checklist-item missing';
+      row.innerHTML = `<span>➕ ${escapeHtml(listItem)}</span><span>No data found</span>`;
+      altList.appendChild(row);
+    });
+
+    const coverageLine = switchItems.length > 0
+      ? `${switchItems.length} item${switchItems.length===1?'':'s'} ${switchItems.length===1?'is':'are'} cheaper at a different nearby store`
+      : 'Everything else is already at your best stop\'s price';
+    altCard.innerHTML = `<div class="trip-coverage">${coverageLine}</div>` +
+      (extraSavings > 0 ? `<div class="trip-total">Extra savings: $${extraSavings.toFixed(2)}</div>` : '');
+    altCard.appendChild(altList);
+    resultsArea.appendChild(altCard);
+  }
 
   // If any list item had zero matches anywhere nearby (not just missing from
   // the best single stop), give a real next step instead of a dead end.
