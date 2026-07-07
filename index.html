@@ -532,7 +532,7 @@
     <button class="btn btn-primary" id="useLocationBtn">📍 Use my current location</button>
     <p class="or-divider">— or —</p>
     <div class="address-field">
-      <input type="text" id="addressInput" placeholder="Type your city or ZIP code" autocomplete="off">
+      <input type="text" id="addressInput" placeholder="Type your address, city, or ZIP code" autocomplete="off">
       <div class="suggestions" id="addressSuggestions"></div>
     </div>
     <button class="btn btn-primary" id="setAddressBtn">Set this as my location</button>
@@ -621,16 +621,42 @@ const US_STATE_ABBR = {
   'West Virginia':'WV','Wisconsin':'WI','Wyoming':'WY','District of Columbia':'DC'
 };
 
-// Formats a Nominatim result as "City, State" instead of its full, cluttered
-// display_name (which usually includes county/country). Falls back gracefully
-// if a place doesn't have both parts (e.g. a small town or a non-US location).
-function formatCityState(result){
+// Formats a Nominatim result as a clean, human address instead of its raw,
+// cluttered display_name. Includes house number/street/unit when the search
+// was specific enough to return one (a full street address), and falls back
+// to just "City, State" for broader searches (city name, ZIP code) where
+// there's no specific street to show.
+function formatAddress(result){
   const addr = result.address || {};
-  const city = addr.city || addr.town || addr.village || addr.hamlet || addr.municipality || result.name;
   const state = (addr.country_code === 'us' && US_STATE_ABBR[addr.state]) || addr.state;
-  if(city && state) return `${city}, ${state}`;
-  if(city) return city;
+  const city = addr.city || addr.town || addr.village || addr.hamlet || addr.municipality || result.name;
+  const houseNumber = addr.house_number;
+  const road = addr.road;
+  const unit = addr.unit || addr.apartment || addr.subunit;
+  const postcode = addr.postcode;
+
+  const parts = [];
+  if(houseNumber && road){
+    parts.push(unit ? `${houseNumber} ${road}, ${unit}` : `${houseNumber} ${road}`);
+  } else if(road){
+    parts.push(road);
+  }
+  if(city) parts.push(city);
+  if(state) parts.push(state);
+  // Only tack on the ZIP when we already have a specific street — for a plain
+  // city/state search, showing the ZIP too is just clutter.
+  if(postcode && houseNumber) parts.push(postcode);
+
+  if(parts.length > 0) return parts.join(', ');
   return result.display_name;
+}
+
+// Strict US-only filter — applied on top of the countrycodes=us query bias,
+// as a defensive second check so nothing from another country can slip into
+// a dropdown even in an edge case where the bias alone doesn't fully apply.
+function isUsResult(result){
+  const addr = result.address || {};
+  return addr.country_code === 'us';
 }
 
 // Builds a Nominatim search URL. Plain 5-digit input is treated as a US ZIP
@@ -657,10 +683,12 @@ async function geocode(query){
   if(!key) return null;
   if(key in geocodeCache) return geocodeCache[key];
   try{
-    const url = buildNominatimUrl(query, 1, false);
+    const url = buildNominatimUrl(query, 3, true);
     const res = await fetch(url);
     const data = await res.json();
-    const result = (data && data[0]) ? { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) } : null;
+    const usResults = (data || []).filter(isUsResult);
+    const best = usResults[0] || null;
+    const result = best ? { lat: parseFloat(best.lat), lon: parseFloat(best.lon) } : null;
     geocodeCache[key] = result;
     return result;
   }catch(err){
@@ -844,17 +872,19 @@ async function fetchSuggestions(query){
 }
 
 function renderSuggestions(results){
-  if(!results.length){
+  const usResults = results.filter(isUsResult);
+  if(!usResults.length){
     hideSuggestions();
     return;
   }
 
-  // Collapse to City, State labels and drop duplicates (multiple raw Nominatim
-  // results can map to the same city-level label once trimmed down).
+  // Format as a full address (or City, State for broader searches) and drop
+  // duplicates — multiple raw Nominatim results can map to the same label
+  // once formatted.
   const seen = new Set();
   const deduped = [];
-  results.forEach(r => {
-    const label = formatCityState(r);
+  usResults.forEach(r => {
+    const label = formatAddress(r);
     const key = label.toLowerCase();
     if(!seen.has(key)){
       seen.add(key);
@@ -895,16 +925,17 @@ async function showDidYouMean(address){
     const url = buildNominatimUrl(address, 5, true);
     const res = await fetch(url);
     const data = await res.json();
+    const usData = (data || []).filter(isUsResult);
 
-    if(!data || data.length === 0){
+    if(usData.length === 0){
       setStatus('Could not find that location. Please check the spelling and try again.', true);
       return;
     }
 
     const seen = new Set();
     const deduped = [];
-    data.forEach(r => {
-      const label = formatCityState(r);
+    usData.forEach(r => {
+      const label = formatAddress(r);
       const key = label.toLowerCase();
       if(!seen.has(key)){
         seen.add(key);
@@ -1087,7 +1118,7 @@ async function renderTripPlan(groceryList, withDistanceItems){
 
   if(!bestStore){
     await renderEmptyState(
-      'No matches found nearby',
+      'No data found nearby',
       `None of your list items were found within ${selectedMiles} miles. Try a wider distance, or check back as more prices get added.`
     );
     return;
@@ -1126,7 +1157,7 @@ async function renderTripPlan(groceryList, withDistanceItems){
     notCovered.forEach(li => {
       const row = document.createElement('div');
       row.className = 'checklist-item missing';
-      row.innerHTML = `<span>➕ ${escapeHtml(li)}</span><span>not found there</span>`;
+      row.innerHTML = `<span>➕ ${escapeHtml(li)}</span><span>No data found</span>`;
       missingDiv.appendChild(row);
     });
     bestCard.appendChild(missingDiv);
@@ -1155,7 +1186,7 @@ async function renderTripPlan(groceryList, withDistanceItems){
       row.innerHTML = `<span>✅ ${escapeHtml(listItem)} — ${escapeHtml(best.store || 'Unnamed store')} (${best._distance.toFixed(1)} mi)</span><span>${escapeHtml(best.priceItem || best.priceWeight)}</span>`;
     } else {
       row.className += ' missing';
-      row.innerHTML = `<span>➕ ${escapeHtml(listItem)}</span><span>not found nearby</span>`;
+      row.innerHTML = `<span>➕ ${escapeHtml(listItem)}</span><span>No data found</span>`;
     }
     altList.appendChild(row);
   });
@@ -1203,7 +1234,7 @@ async function renderBrowseAll(items){
 
   if(items.length === 0){
     await renderEmptyState(
-      'No bargains found that close',
+      'No data found nearby',
       'Try a wider distance, or check back later as more prices get added.'
     );
     return;
